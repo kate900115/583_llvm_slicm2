@@ -342,22 +342,6 @@ bool slicmpass::runOnLoop(Loop *L, LPPassManager &LPM) {
 	}
 
 
-	map<BasicBlock*, int> redoBBMap;
-	vector<Instruction*> storeInstVec;
-
-	// get all of the store in the loop
-	// store them into store map
-	for (Loop::block_iterator I = L->block_begin(), E = L->block_end(); I != E; ++I) {
-		BasicBlock *BB = *I;
-		if ((LI->getLoopFor(BB) == L) && (redoBBMap.find(BB)==redoBBMap.end())){      
-			for (BasicBlock::iterator inst = BB->begin(); inst!=BB->end(); inst++){
-				if (inst->getOpcode()==Instruction::Store){
-					storeInstVec.push_back(inst);
-				}
-			}
-		}
-	}
-	
 
 	map<Instruction*,vector<Instruction*> > dependChains;//for BFS
 	map<Instruction*, Instruction*> hoistedInstructions;//current inst, first load inst
@@ -368,7 +352,41 @@ bool slicmpass::runOnLoop(Loop *L, LPPassManager &LPM) {
 	map<unsigned int, Instruction*> idToInstMap = LAMP->IdToInstMap;
 	map<Instruction*, unsigned int> instToIdMap = LAMP->InstToIdMap;
 	map<pair<Instruction*, Instruction*>*, unsigned int> depToTimesMap = LAMP->DepToTimesMap;
+
+	// record Load and dependent store numbers
+	map<Instruction*, float> LoadDepFreqMap;
+	map<Instruction*, int> LoadDependNumMap;
 	
+	map<BasicBlock*, int> redoBBMap;
+	vector<Instruction*> storeInstVec;
+
+	// get all of the store in the loop
+	// store them into store map
+	// get all load execution count
+	
+	for (map<pair<Instruction*, Instruction*>*, unsigned int >::iterator it = depToTimesMap.begin(); it != depToTimesMap.end(); it++){
+		Instruction* ldInst = it->first->first;
+		if (LoadDependNumMap.find(ldInst)==LoadDependNumMap.end()){
+			LoadDependNumMap[ldInst] = it->second;
+		}
+		else{
+			LoadDependNumMap[ldInst] += it->second;
+		}
+	}
+	
+	for (Loop::block_iterator I = L->block_begin(), E = L->block_end(); I != E; ++I) {
+		BasicBlock *BB = *I;
+		if ((LI->getLoopFor(BB) == L) && (redoBBMap.find(BB)==redoBBMap.end())){      
+			for (BasicBlock::iterator inst = BB->begin(); inst!=BB->end(); inst++){
+				if (inst->getOpcode()==Instruction::Store){
+					storeInstVec.push_back(inst);
+				}
+				else if (inst->getOpcode()==Instruction::Load){
+					LoadDepFreqMap[inst] = float(LoadDependNumMap[inst])/float(PI->getExecutionCount(BB));
+				}
+			}
+		}
+	}
 
 
 	// hoist loads and get its dependency chain

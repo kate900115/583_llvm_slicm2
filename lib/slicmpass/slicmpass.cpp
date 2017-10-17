@@ -236,6 +236,9 @@ bool slicmpass::runOnLoop(Loop *L, LPPassManager &LPM) {
 
 	TD = getAnalysisIfAvailable<DataLayout>();
 	TLI = &getAnalysis<TargetLibraryInfo>();
+	
+	PI = &getAnalysis<ProfileInfo>();
+	LAMP = &getAnalysis<LAMPLoadProfile>();
 
 	CurAST = new AliasSetTracker(*AA);
 	// Collect Alias info from subloops.
@@ -361,6 +364,12 @@ bool slicmpass::runOnLoop(Loop *L, LPPassManager &LPM) {
 	map<Instruction*, BasicBlock*> instBBMap;
 	map<Instruction*, Instruction*> whereToSplit;
 
+	// LAMP profiling information
+	map<unsigned int, Instruction*> idToInstMap = LAMP->IdToInstMap;
+	map<Instruction*, unsigned int> instToIdMap = LAMP->InstToIdMap;
+	map<pair<Instruction*, Instruction*>*, unsigned int> depToTimesMap = LAMP->DepToTimesMap;
+	
+
 
 	// hoist loads and get its dependency chain
 	for (Loop::block_iterator I = L->block_begin(), E = L->block_end(); I != E; ++I) {
@@ -373,6 +382,7 @@ bool slicmpass::runOnLoop(Loop *L, LPPassManager &LPM) {
 			for (BasicBlock::iterator inst = BB->begin(); inst!=BB->end(); inst++){
 				if ((canSinkOrHoistLoadAndDependency(*inst))&&(inst->getOpcode()==Instruction::Load)&&(CurLoop->hasLoopInvariantOperands(inst)) && isSafeToExecuteUnconditionally(*inst)){
 					Instruction* firstLoadInst = inst;
+					
 
 					// if there is a eligible load instruction existing inside the basic block
 					// use BFS to find all instructions on the depend chain within this basic block			

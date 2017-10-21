@@ -366,11 +366,15 @@ bool slicmpass::runOnLoop(Loop *L, LPPassManager &LPM) {
 	
 	for (map<pair<Instruction*, Instruction*>*, unsigned int >::iterator it = depToTimesMap.begin(); it != depToTimesMap.end(); it++){
 		Instruction* ldInst = it->first->first;
-		if (LoadDependNumMap.find(ldInst)==LoadDependNumMap.end()){
-			LoadDependNumMap[ldInst] = it->second;
-		}
-		else{
-			LoadDependNumMap[ldInst] += it->second;
+		Instruction* stInst = it->first->second;
+		BasicBlock* currentBB = stInst->getParent();
+		if (CurLoop->contains(currentBB)){
+			if (LoadDependNumMap.find(ldInst)==LoadDependNumMap.end()){
+				LoadDependNumMap[ldInst] = it->second;
+			}
+			else{
+				LoadDependNumMap[ldInst] += it->second;
+			}
 		}
 	}
 	
@@ -397,48 +401,53 @@ bool slicmpass::runOnLoop(Loop *L, LPPassManager &LPM) {
 			// find the first load and split the block from this load
 			// check if the source register of this load instruction is unchanged
 			// if it is unchanged, then this load instruction can be hoisted
-			for (BasicBlock::iterator inst = BB->begin(); inst!=BB->end(); inst++){
+			for (BasicBlock::iterator inst = BB->begin(); inst!=BB->end(); ){
 				if ((canSinkOrHoistLoadAndDependency(*inst))&&(inst->getOpcode()==Instruction::Load)&&(CurLoop->hasLoopInvariantOperands(inst)) && isSafeToExecuteUnconditionally(*inst)){
 					Instruction* firstLoadInst = inst;
-					
+					if (LoadDepFreqMap[inst]<0.2){	
 
-					// if there is a eligible load instruction existing inside the basic block
-					// use BFS to find all instructions on the depend chain within this basic block			
-					errs()<<" #### first load inst: "<<*firstLoadInst<<"\n";
+						// if there is a eligible load instruction existing inside the basic block
+						// use BFS to find all instructions on the depend chain within this basic block			
+						errs()<<" #### first load inst: "<<*firstLoadInst<<"\n";
+						errs()<<" #### the dependency is: "<<LoadDepFreqMap[inst]<<"\n";
 			
-					vector<Instruction*> dependencyChain;
-					dependencyChain.push_back(firstLoadInst);
-					hoistedInstructions[firstLoadInst] = firstLoadInst;
-					inst++;
-					hoist(*firstLoadInst);
+						vector<Instruction*> dependencyChain;
+						dependencyChain.push_back(firstLoadInst);
+						hoistedInstructions[firstLoadInst] = firstLoadInst;
+						inst++;
+						hoist(*firstLoadInst);
 
-					for (unsigned int i=0; i<dependencyChain.size(); i++){
-						for (Value::use_iterator UI = dependencyChain[i]->use_begin(); UI!=dependencyChain[i]->use_end(); UI++){
-							Instruction *User = dyn_cast<Instruction>(*UI);
-							errs()<<"User is :"<<*User<<"\n";
-							if ((canSinkOrHoistLoadAndDependency(*User))&&(CurLoop->hasLoopInvariantOperands(User)) && isSafeToExecuteUnconditionally(*User)){
-								errs()<<"Hoist user\n";
-								for (unsigned int j=0; j<User->getNumOperands(); j++){
-									Value* tempV=User->getOperand(j);
-									Instruction* tempI = dyn_cast<Instruction>(tempV);
+						for (unsigned int i=0; i<dependencyChain.size(); i++){
+							for (Value::use_iterator UI = dependencyChain[i]->use_begin(); UI!=dependencyChain[i]->use_end(); UI++){
+								Instruction *User = dyn_cast<Instruction>(*UI);
+								errs()<<"User is :"<<*User<<"\n";
+								if ((canSinkOrHoistLoadAndDependency(*User))&&(CurLoop->hasLoopInvariantOperands(User)) && isSafeToExecuteUnconditionally(*User)){
+									errs()<<"Hoist user\n";
+									for (unsigned int j=0; j<User->getNumOperands(); j++){
+										Value* tempV=User->getOperand(j);
+										Instruction* tempI = dyn_cast<Instruction>(tempV);
 																	
-									if ((tempI!=dependencyChain[i])&&(tempI!=NULL)){
-										// need to insert User into another dependency Chain
-										Instruction* oldFirstLoad = hoistedInstructions[tempI];
-										dependChains[oldFirstLoad].push_back(User);
+										if ((tempI!=dependencyChain[i])&&(tempI!=NULL)){
+											// need to insert User into another dependency Chain
+											Instruction* oldFirstLoad = hoistedInstructions[tempI];
+											dependChains[oldFirstLoad].push_back(User);
+										}
 									}
+									dependencyChain.push_back(User);
+									hoistedInstructions[User] = firstLoadInst;
+									if (User==inst) inst++;
+									hoist(*User);
 								}
-								dependencyChain.push_back(User);
-								hoistedInstructions[User] = firstLoadInst;
-								if (User==inst) inst++;
-								hoist(*User);
 							}  					
 						}
-					}
 
-					dependChains[firstLoadInst] = dependencyChain;
-					instBBMap[firstLoadInst] = BB;
-					whereToSplit[firstLoadInst] = inst;
+						dependChains[firstLoadInst] = dependencyChain;
+						instBBMap[firstLoadInst] = BB;
+						whereToSplit[firstLoadInst] = inst;
+					}
+				}
+				else{
+					inst++;
 				}
 			}
 		}
@@ -449,7 +458,8 @@ bool slicmpass::runOnLoop(Loop *L, LPPassManager &LPM) {
 		Instruction* splitInst = whereToSplit[it->first];
 		BasicBlock* splitBlock = instBBMap[it->first];
 		// create a flag at the end of the preheader for redoBB
-		AllocaInst *flag = new AllocaInst(Type::getInt1Ty(Preheader->getContext()), "flag", Preheader->getTerminator());
+		Function* currentFunc = Preheader->getParent();
+		AllocaInst *flag = new AllocaInst(Type::getInt1Ty(Preheader->getContext()), "flag", currentFunc->getEntryBlock().getTerminator());
 		StoreInst *ST = new StoreInst(ConstantInt::getFalse(Preheader->getContext()), flag, Preheader->getTerminator());
 
 		// create comparision instruction after all store instructions
@@ -500,10 +510,10 @@ bool slicmpass::runOnLoop(Loop *L, LPPassManager &LPM) {
 
 			// need to add store and load instruction to save the value of the dest reg into a stack
 			// insert store in Preheader
-			AllocaInst *var = new AllocaInst(IntegerType::get(Preheader->getContext(),32), "var", dependencyChain[i]->getNextNode());
+			AllocaInst *var = new AllocaInst(IntegerType::get(currentFunc->getEntryBlock().getContext(),32), "var", currentFunc->getEntryBlock().getTerminator());
 			var->setAlignment(4);
 			StoreInst *storeVar = new StoreInst(dependencyChain[i], var);
-			storeVar->insertAfter(var);
+			storeVar->insertAfter(dependencyChain[i]);
 			storeMap[storeVar] = 1;
 
 			// insert store in redo BB

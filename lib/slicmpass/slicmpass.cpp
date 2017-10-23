@@ -347,6 +347,7 @@ bool slicmpass::runOnLoop(Loop *L, LPPassManager &LPM) {
 	map<Instruction*, Instruction*> hoistedInstructions;//current inst, first load inst
 	map<Instruction*, BasicBlock*> instBBMap;
 	map<Instruction*, Instruction*> whereToSplit;
+	map<Instruction*, Instruction*> splitToLoad;
 
 	// LAMP profiling information
 	map<unsigned int, Instruction*> idToInstMap = LAMP->IdToInstMap;
@@ -409,12 +410,20 @@ bool slicmpass::runOnLoop(Loop *L, LPPassManager &LPM) {
 						// if there is a eligible load instruction existing inside the basic block
 						// use BFS to find all instructions on the depend chain within this basic block			
 						errs()<<" #### first load inst: "<<*firstLoadInst<<"\n";
-						errs()<<" #### the dependency is: "<<LoadDepFreqMap[inst]<<"\n";
 			
 						vector<Instruction*> dependencyChain;
 						dependencyChain.push_back(firstLoadInst);
 						hoistedInstructions[firstLoadInst] = firstLoadInst;
 						inst++;
+
+						// to check if the hoisted instruction is the split instruction
+						if (splitToLoad.find(firstLoadInst)!=splitToLoad.end()){
+							Instruction* key = splitToLoad[firstLoadInst];
+							splitToLoad.erase(firstLoadInst);
+							splitToLoad[++firstLoadInst]=key;
+							whereToSplit.erase(key);
+							whereToSplit[key] = ++firstLoadInst;
+						}
 						hoist(*firstLoadInst);
 
 						for (unsigned int i=0; i<dependencyChain.size(); i++){
@@ -436,14 +445,28 @@ bool slicmpass::runOnLoop(Loop *L, LPPassManager &LPM) {
 									dependencyChain.push_back(User);
 									hoistedInstructions[User] = firstLoadInst;
 									if (User==inst) inst++;
+
+									// to check if the hoisted instruction is the split instruction
+									if (splitToLoad.find(User)!=splitToLoad.end()){
+										Instruction* key = splitToLoad[User];
+										splitToLoad.erase(User);
+										splitToLoad[++User]=key;
+										whereToSplit.erase(key);
+										whereToSplit[key] = ++User;
+									}
+
 									hoist(*User);
-								}
-							}  					
+								}  					
+							}
 						}
 
 						dependChains[firstLoadInst] = dependencyChain;
 						instBBMap[firstLoadInst] = BB;
-						whereToSplit[firstLoadInst] = inst;
+
+						//record the split instruction of the first load
+						whereToSplit[firstLoadInst] = inst;					
+						splitToLoad[inst] = firstLoadInst;
+
 					}
 				}
 				else{
@@ -458,8 +481,8 @@ bool slicmpass::runOnLoop(Loop *L, LPPassManager &LPM) {
 		Instruction* splitInst = whereToSplit[it->first];
 		BasicBlock* splitBlock = instBBMap[it->first];
 		// create a flag at the end of the preheader for redoBB
-		Function* currentFunc = Preheader->getParent();
-		AllocaInst *flag = new AllocaInst(Type::getInt1Ty(Preheader->getContext()), "flag", currentFunc->getEntryBlock().getTerminator());
+		Function* currentFunc = (Preheader->getParent());
+		AllocaInst *flag = new AllocaInst(Type::getInt1Ty(currentFunc->getEntryBlock().getContext()), "flag", currentFunc->getEntryBlock().getTerminator());
 		StoreInst *ST = new StoreInst(ConstantInt::getFalse(Preheader->getContext()), flag, Preheader->getTerminator());
 
 		// create comparision instruction after all store instructions
@@ -474,7 +497,7 @@ bool slicmpass::runOnLoop(Loop *L, LPPassManager &LPM) {
 		}
 
 
- 		// create load and CMP instruction 
+ 		// create load and CMP instruction before split instruction
 		LoadInst* LD = new LoadInst(flag, "flag", splitInst);
 
 		// split the block
@@ -485,7 +508,7 @@ bool slicmpass::runOnLoop(Loop *L, LPPassManager &LPM) {
 		BasicBlock* nextBB = SplitEdge(splitBlock, redoBB, this);
 
 		// create a branch
-		BranchInst::Create(nextBB, redoBB, LD, splitBlock->getTerminator());
+		BranchInst::Create(redoBB, nextBB, LD, splitBlock->getTerminator());
 		// erase the original terminator
 		splitBlock->getTerminator()->eraseFromParent();
 
@@ -493,25 +516,32 @@ bool slicmpass::runOnLoop(Loop *L, LPPassManager &LPM) {
 		vector<Instruction*> dependencyChain = it->second;
 		map <Instruction*, int> storeMap;
 		map <Instruction*, Instruction*> loadMap;
+		map <Instruction*, Instruction*> prehToRedo;
 		for (unsigned int i=0; i<dependencyChain.size(); i++){
 			// clone and insert into redo BB
 			Instruction* hoistedInst = dependencyChain[i]->clone();
 			redoBB->getInstList().insert(redoBB->getTerminator(), hoistedInst);
+			prehToRedo[dependencyChain[i]]=hoistedInst;
 			
-			if (i!=0){
-				for (unsigned int j=0; j<dependencyChain[i]->getNumOperands(); j++){
-					Value* v = dependencyChain[i]->getOperand(j);
-					Instruction* operandInst = dyn_cast<Instruction>(v);
-					if (loadMap.find(operandInst)!=loadMap.end()){
-						hoistedInst->setOperand(j,loadMap[operandInst]);
-					}	
-				}
-			}
+//			if (i!=0){
+//				for (unsigned int j=0; j<dependencyChain[i]->getNumOperands(); j++){
+//					Value* v = dependencyChain[i]->getOperand(j);
+//					Instruction* operandInst = dyn_cast<Instruction>(v);
+//					if (loadMap.find(operandInst)!=loadMap.end()){
+//						hoistedInst->setOperand(j,loadMap[operandInst]);
+//					}	
+//				}
+//			}
 
 			// need to add store and load instruction to save the value of the dest reg into a stack
 			// insert store in Preheader
-			AllocaInst *var = new AllocaInst(IntegerType::get(currentFunc->getEntryBlock().getContext(),32), "var", currentFunc->getEntryBlock().getTerminator());
-			var->setAlignment(4);
+	//		AllocaInst *var = new AllocaInst(IntegerType::get(EntryBlock->getContext(),32), "var", dependencyChain[i]->getNextNode());
+			
+			
+		//	AllocaInst *var = new AllocaInst(IntegerType::get(currentFunc->getEntryBlock().getContext(),32), "var", currentFunc->getEntryBlock().getTerminator());
+
+			AllocaInst *var = new AllocaInst(dependencyChain[i]->getType(), "var", currentFunc->getEntryBlock().getTerminator());
+		//	var->setAlignment(4);
 			StoreInst *storeVar = new StoreInst(dependencyChain[i], var);
 			storeVar->insertAfter(dependencyChain[i]);
 			storeMap[storeVar] = 1;
@@ -519,26 +549,44 @@ bool slicmpass::runOnLoop(Loop *L, LPPassManager &LPM) {
 			// insert store in redo BB
 			StoreInst *storeVar2 = new StoreInst(hoistedInst, var);
 			storeVar2->insertAfter(hoistedInst);
-			storeMap[storeVar2] = 1; 
+			storeMap[storeVar2] = 1;
 
 			// all user of the hoisted instruction need to load var before use it 
 			for (Value::use_iterator UI = dependencyChain[i]->use_begin(); UI != dependencyChain[i]->use_end(); UI++){
 				Instruction *User = dyn_cast<Instruction>(*UI);
 
-				for (unsigned int j =0; j!=User->getNumOperands(); j++){
+				for (unsigned int j =0; j!=User->getNumOperands(); j++){	
 					Instruction* temp = dyn_cast<Instruction>(User->getOperand(j));
 					if ((temp==dependencyChain[i])&&(storeMap.find(User)==storeMap.end())){
 						LoadInst* loadVar = new LoadInst(var, "load var", User);
-						LoadInst* loadVar_redoBB = new LoadInst(var, "load_var", storeVar2->getNextNode());
-						loadMap[loadVar] = loadVar_redoBB;
+						if (User->getParent()==Preheader){
+							loadMap[loadVar] = var;
+						}
+					//loadMap[loadVar] = loadVar_redoBB;
 						
 						User->setOperand(j, loadVar);
 					}
 				}	 
 			}
 		}
-	}
 
+
+		// insert load into redo BB and modify the dependency
+		for (map<Instruction*, Instruction*>::iterator it = loadMap.begin(); it!=loadMap.end(); it++){
+			Instruction* originalInst = it->first->getNextNode();
+			Instruction* toBeInsertInst = prehToRedo[originalInst];
+			LoadInst* loadVar_redoBB = new LoadInst(it->second, "load_var", toBeInsertInst);
+			for (unsigned int j=0; j<originalInst->getNumOperands(); j++){
+				Value* v = toBeInsertInst->getOperand(j);
+				Instruction* operandInst = dyn_cast<Instruction>(v);
+				if (operandInst==it->first){
+					
+					toBeInsertInst->setOperand(j,loadVar_redoBB);
+				}	
+			}
+		}
+		StoreInst *STinRedo = new StoreInst(ConstantInt::getFalse(Preheader->getContext()), flag, redoBB->getTerminator());
+	}	
 
 	// FOR TEST: check the inst in the preheader
 	errs()<<"check after the inst is hoisted into the preheader. now insts in the preheader are:\n";

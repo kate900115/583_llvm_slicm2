@@ -344,10 +344,13 @@ bool slicmpass::runOnLoop(Loop *L, LPPassManager &LPM) {
 
 
 	map<Instruction*,vector<Instruction*> > dependChains;//for BFS
-	map<Instruction*, Instruction*> hoistedInstructions;//current inst, first load inst
 	map<Instruction*, BasicBlock*> instBBMap;
 	map<Instruction*, Instruction*> whereToSplit;
-	map<Instruction*, Instruction*> splitToLoad;
+	map<Instruction*, vector<Instruction*> > splitToLoad;
+	vector<Instruction*> hoistLoadOrder;
+	
+	map<Instruction*, Instruction*> instToFirstLoad;
+	map<Instruction*, int> firstLoadOrder;
 
 	// LAMP profiling information
 	map<unsigned int, Instruction*> idToInstMap = LAMP->IdToInstMap;
@@ -394,6 +397,7 @@ bool slicmpass::runOnLoop(Loop *L, LPPassManager &LPM) {
 	}
 
 
+
 	// hoist loads and get its dependency chain
 	for (Loop::block_iterator I = L->block_begin(), E = L->block_end(); I != E; ++I) {
 		BasicBlock *BB = *I;
@@ -405,101 +409,151 @@ bool slicmpass::runOnLoop(Loop *L, LPPassManager &LPM) {
 			for (BasicBlock::iterator inst = BB->begin(); inst!=BB->end(); ){
 				if ((canSinkOrHoistLoadAndDependency(*inst))&&(inst->getOpcode()==Instruction::Load)&&(CurLoop->hasLoopInvariantOperands(inst)) && isSafeToExecuteUnconditionally(*inst)){
 					Instruction* firstLoadInst = inst;
-					if (LoadDepFreqMap[inst]<0.2){	
+
+					if (LoadDepFreqMap[inst]<0.2){
 
 						// if there is a eligible load instruction existing inside the basic block
 						// use BFS to find all instructions on the depend chain within this basic block			
 						errs()<<" #### first load inst: "<<*firstLoadInst<<"\n";
-			
+				
 						vector<Instruction*> dependencyChain;
 						dependencyChain.push_back(firstLoadInst);
-						hoistedInstructions[firstLoadInst] = firstLoadInst;
+						instToFirstLoad[firstLoadInst] = firstLoadInst;
 						inst++;
-
+					
 						// to check if the hoisted instruction is the split instruction
 						if (splitToLoad.find(firstLoadInst)!=splitToLoad.end()){
-							Instruction* key = splitToLoad[firstLoadInst];
+	
+							vector<Instruction*> keys = splitToLoad[firstLoadInst];
+							for (unsigned int i=0; i<keys.size(); i++){
+								errs()<<"@@@@ There is a conflict: "<<*keys[i]<<","<<*firstLoadInst<<"\n";
+								whereToSplit.erase(keys[i]);
+								whereToSplit[keys[i]] = firstLoadInst->getNextNode();
+								errs()<<"@@@@ after change: "<<*keys[i]<<","<<*whereToSplit[keys[i]]<<"\n";
+
+							}
 							splitToLoad.erase(firstLoadInst);
-							splitToLoad[++firstLoadInst]=key;
-							whereToSplit.erase(key);
-							whereToSplit[key] = ++firstLoadInst;
+							splitToLoad[firstLoadInst->getNextNode()]=keys;
 						}
+					
 						hoist(*firstLoadInst);
+		
 
 						for (unsigned int i=0; i<dependencyChain.size(); i++){
 							for (Value::use_iterator UI = dependencyChain[i]->use_begin(); UI!=dependencyChain[i]->use_end(); UI++){
 								Instruction *User = dyn_cast<Instruction>(*UI);
-								errs()<<"User is :"<<*User<<"\n";
 								if ((canSinkOrHoistLoadAndDependency(*User))&&(CurLoop->hasLoopInvariantOperands(User)) && isSafeToExecuteUnconditionally(*User)){
-									errs()<<"Hoist user\n";
 									for (unsigned int j=0; j<User->getNumOperands(); j++){
 										Value* tempV=User->getOperand(j);
 										Instruction* tempI = dyn_cast<Instruction>(tempV);
-																	
-										if ((tempI!=dependencyChain[i])&&(tempI!=NULL)){
-											// need to insert User into another dependency Chain
-											Instruction* oldFirstLoad = hoistedInstructions[tempI];
-											dependChains[oldFirstLoad].push_back(User);
-										}
 									}
 									dependencyChain.push_back(User);
-									hoistedInstructions[User] = firstLoadInst;
+									instToFirstLoad[User] = firstLoadInst;
+							
+							
 									if (User==inst) inst++;
 
 									// to check if the hoisted instruction is the split instruction
 									if (splitToLoad.find(User)!=splitToLoad.end()){
-										Instruction* key = splitToLoad[User];
-										splitToLoad.erase(User);
-										splitToLoad[++User]=key;
-										whereToSplit.erase(key);
-										whereToSplit[key] = ++User;
-									}
 
+										vector<Instruction*> keys = splitToLoad[User];
+										for (unsigned int i=0; i<keys.size(); i++){
+											errs()<<"@@@@ There is a conflict: "<<*keys[i]<<","<<*User<<"\n";
+											whereToSplit.erase(keys[i]);
+											whereToSplit[keys[i]] = User->getNextNode();
+											errs()<<"@@@@ after change: "<<*keys[i]<<","<<*whereToSplit[keys[i]]<<"\n";
+										}
+
+										splitToLoad.erase(User);
+										splitToLoad[User->getNextNode()]=keys;
+
+									}
+									errs()<<"-----hoisted instructions: "<<*User<<"\n";
 									hoist(*User);
-								}  					
+								}					
 							}
 						}
-
 						dependChains[firstLoadInst] = dependencyChain;
+						hoistLoadOrder.push_back(firstLoadInst);
 						instBBMap[firstLoadInst] = BB;
 
 						//record the split instruction of the first load
-						whereToSplit[firstLoadInst] = inst;					
-						splitToLoad[inst] = firstLoadInst;
-
+						whereToSplit[firstLoadInst] = inst;
+						if (splitToLoad.find(inst)==splitToLoad.end()){
+							vector<Instruction*> temp;
+							temp.push_back(firstLoadInst);
+							splitToLoad[inst] = temp;
+						}				
+						else{
+							splitToLoad[inst].push_back(firstLoadInst);
+						}	
+						errs()<<"what add to the map:"<<*firstLoadInst<<","<<*inst<<"\n";
+					}
+					else{
+						inst++;
 					}
 				}
 				else{
 					inst++;
 				}
+				
 			}
 		}
 	}
+	for(map<Instruction*, Instruction*>::iterator it = whereToSplit.begin(); it != whereToSplit.end(); it++){
+		errs()<<*it->first<<","<<*it->second<<"\n";
+	}
+
+	errs()<<"dependChain size: "<<dependChains.size()<<"\n";
+	for (int j=0; j<hoistLoadOrder.size(); j++){
+		errs()<<"it->first: "<<hoistLoadOrder[j]<<"\n";
+		errs()<<"it->second: \n";
+		for (int i=0; i<dependChains[hoistLoadOrder[j]].size(); i++){
+			errs()<<*(dependChains[hoistLoadOrder[j]][i])<<",";
+		}
+		errs()<<"\n";
+	}
 
 	// create redoBB, flag and so on...
-	for (map<Instruction*,vector<Instruction*> >::iterator it = dependChains.begin(); it!=dependChains.end(); it++){
-		Instruction* splitInst = whereToSplit[it->first];
-		BasicBlock* splitBlock = instBBMap[it->first];
+
+
+	map <Instruction*, Instruction*> instVarMap;
+	map <Instruction*, Instruction*> prehToRedo;
+	map <Instruction*, Instruction*> firstLoadFlagMap;
+	map <BasicBlock*, Instruction*> BBFlagMap;
+
+	for (unsigned int k=0; k<hoistLoadOrder.size(); k++){
+		firstLoadOrder[hoistLoadOrder[k]] = k;
+	}	
+
+	for (unsigned int k=0; k<hoistLoadOrder.size(); k++){
+		Instruction* splitInst = whereToSplit[hoistLoadOrder[k]];
+		errs()<<"where to split: "<<*splitInst<<"\n";
+		BasicBlock* splitBlock = splitInst->getParent();
+
 		// create a flag at the end of the preheader for redoBB
 		Function* currentFunc = (Preheader->getParent());
 		AllocaInst *flag = new AllocaInst(Type::getInt1Ty(currentFunc->getEntryBlock().getContext()), "flag", currentFunc->getEntryBlock().getTerminator());
 		StoreInst *ST = new StoreInst(ConstantInt::getFalse(Preheader->getContext()), flag, Preheader->getTerminator());
 
 		// create comparision instruction after all store instructions
-		Instruction* loadInst = it->first;
+		Instruction* loadInst = hoistLoadOrder[k];
 		Value* LoadRegValue = loadInst->getOperand(0);
 		for (unsigned int i=0; i<storeInstVec.size(); i++){
 			Instruction* storeInst = storeInstVec[i];
 			Value* StoreRegValue = storeInst->getOperand(1);
 			ICmpInst* ICMP = new ICmpInst(storeInst->getNextNode(), ICmpInst::ICMP_EQ, StoreRegValue, LoadRegValue, "cmp");
-			StoreInst* StoreFlag = new StoreInst(ICMP, flag);
-			StoreFlag->insertAfter(ICMP);	
+			LoadInst* LoadFlag = new LoadInst(flag, "ldflag", ICMP->getNextNode());
+			BinaryOperator* newOr = BinaryOperator::Create(Instruction::Or, ICMP, LoadFlag, "or", LoadFlag->getNextNode());
+			StoreInst* StoreFlag = new StoreInst(newOr, flag);
+			StoreFlag->insertAfter(newOr);	
 		}
 
-
  		// create load and CMP instruction before split instruction
+		errs()<<"$$$$ split inst:"<<*splitInst<<"\n";
+		errs()<<"$$$$ "<<*splitInst->getParent()<<"\n";
 		LoadInst* LD = new LoadInst(flag, "flag", splitInst);
-
+		
 		// split the block
 		BasicBlock* redoBB = SplitBlock(splitBlock, LD->getNextNode(), this);	
 		redoBBMap[redoBB] = 1;
@@ -512,81 +566,105 @@ bool slicmpass::runOnLoop(Loop *L, LPPassManager &LPM) {
 		// erase the original terminator
 		splitBlock->getTerminator()->eraseFromParent();
 
+
+
 		// copy the hoisted instruction into redoBB
-		vector<Instruction*> dependencyChain = it->second;
-		map <Instruction*, int> storeMap;
-		map <Instruction*, Instruction*> loadMap;
-		map <Instruction*, Instruction*> prehToRedo;
+		vector<Instruction*> dependencyChain = dependChains[hoistLoadOrder[k]];
 		for (unsigned int i=0; i<dependencyChain.size(); i++){
 			// clone and insert into redo BB
 			Instruction* hoistedInst = dependencyChain[i]->clone();
 			redoBB->getInstList().insert(redoBB->getTerminator(), hoistedInst);
 			prehToRedo[dependencyChain[i]]=hoistedInst;
-			
-//			if (i!=0){
-//				for (unsigned int j=0; j<dependencyChain[i]->getNumOperands(); j++){
-//					Value* v = dependencyChain[i]->getOperand(j);
-//					Instruction* operandInst = dyn_cast<Instruction>(v);
-//					if (loadMap.find(operandInst)!=loadMap.end()){
-//						hoistedInst->setOperand(j,loadMap[operandInst]);
-//					}	
-//				}
-//			}
 
 			// need to add store and load instruction to save the value of the dest reg into a stack
 			// insert store in Preheader
-	//		AllocaInst *var = new AllocaInst(IntegerType::get(EntryBlock->getContext(),32), "var", dependencyChain[i]->getNextNode());
-			
-			
-		//	AllocaInst *var = new AllocaInst(IntegerType::get(currentFunc->getEntryBlock().getContext(),32), "var", currentFunc->getEntryBlock().getTerminator());
 
 			AllocaInst *var = new AllocaInst(dependencyChain[i]->getType(), "var", currentFunc->getEntryBlock().getTerminator());
-		//	var->setAlignment(4);
 			StoreInst *storeVar = new StoreInst(dependencyChain[i], var);
 			storeVar->insertAfter(dependencyChain[i]);
-			storeMap[storeVar] = 1;
+			
+			instVarMap[dependencyChain[i]] = var;
 
 			// insert store in redo BB
 			StoreInst *storeVar2 = new StoreInst(hoistedInst, var);
 			storeVar2->insertAfter(hoistedInst);
-			storeMap[storeVar2] = 1;
 
-			// all user of the hoisted instruction need to load var before use it 
-			for (Value::use_iterator UI = dependencyChain[i]->use_begin(); UI != dependencyChain[i]->use_end(); UI++){
-				Instruction *User = dyn_cast<Instruction>(*UI);
-
-				for (unsigned int j =0; j!=User->getNumOperands(); j++){	
-					Instruction* temp = dyn_cast<Instruction>(User->getOperand(j));
-					if ((temp==dependencyChain[i])&&(storeMap.find(User)==storeMap.end())){
-						LoadInst* loadVar = new LoadInst(var, "load var", User);
-						if (User->getParent()==Preheader){
-							loadMap[loadVar] = var;
+			// insert load before user
+			for (Value::use_iterator UI = dependencyChain[i]->use_begin(); UI!=dependencyChain[i]->use_end(); UI++){
+				Instruction* User = dyn_cast<Instruction>(*UI);
+				if ((redoBBMap.find(User->getParent())==redoBBMap.end())&&(User->getParent()!=Preheader)){
+					for (unsigned int j=0; j!=User->getNumOperands(); j++){
+						Instruction* temp = dyn_cast<Instruction>(User->getOperand(j));
+						if (temp==dependencyChain[i]){
+						//	errs()<<"BB: "<<*User->getParent()<<"\n";
+						//	errs()<<"original user: "<<*User<<"\n";
+							LoadInst* ldvar = new LoadInst(var, "load", User);
+							User->setOperand(j, ldvar);
+						//	errs()<<"user: "<<*User<<"\n";
 						}
-					//loadMap[loadVar] = loadVar_redoBB;
-						
-						User->setOperand(j, loadVar);
 					}
-				}	 
+				}
 			}
-		}
-
-
-		// insert load into redo BB and modify the dependency
-		for (map<Instruction*, Instruction*>::iterator it = loadMap.begin(); it!=loadMap.end(); it++){
-			Instruction* originalInst = it->first->getNextNode();
-			Instruction* toBeInsertInst = prehToRedo[originalInst];
-			LoadInst* loadVar_redoBB = new LoadInst(it->second, "load_var", toBeInsertInst);
-			for (unsigned int j=0; j<originalInst->getNumOperands(); j++){
-				Value* v = toBeInsertInst->getOperand(j);
-				Instruction* operandInst = dyn_cast<Instruction>(v);
-				if (operandInst==it->first){
-					
-					toBeInsertInst->setOperand(j,loadVar_redoBB);
-				}	
-			}
+			
 		}
 		StoreInst *STinRedo = new StoreInst(ConstantInt::getFalse(Preheader->getContext()), flag, redoBB->getTerminator());
-	}	
+		firstLoadFlagMap[hoistLoadOrder[k]] = flag;
+		BBFlagMap[redoBB] = flag;
+		
+	}
+
+	// insert load in the redoBB before user
+	for (unsigned int i=0; i<hoistLoadOrder.size(); i++){
+		vector<Instruction*> dependencyChain = dependChains[hoistLoadOrder[i]];
+		for (unsigned int j=0; j<dependencyChain.size(); j++){
+			Instruction* inst = dependencyChain[j];
+			for (unsigned int k =0; k!=inst->getNumOperands(); k++){	
+				if (inst->getOperand(k)!=NULL){
+					Instruction* temp = dyn_cast<Instruction>(inst->getOperand(k));
+					if (instVarMap.find(temp)!=instVarMap.end()){
+						Instruction* redoInst = prehToRedo[inst];
+						Instruction* var = instVarMap[temp];
+						LoadInst* loadVar = new LoadInst(var, "load var", redoInst);	
+						redoInst->setOperand(k, loadVar);
+					}
+				}
+			}
+		}
+	}
+
+	// find the dependency between basicblock
+	map < pair<BasicBlock*, BasicBlock*>,int> dependBBMap; //second depend on first
+	for (map<Instruction*, Instruction*>::iterator it = instToFirstLoad.begin(); it!=instToFirstLoad.end(); it++){
+		Instruction* currentInst = it->first;
+		// check all user to see if there is a User in another block after the current inst's block
+		for (Value::use_iterator UI = currentInst->use_begin(); UI!=currentInst->use_end(); UI++){
+			Instruction* User = dyn_cast<Instruction>(*UI);
+			// if User is in preheader
+			if (prehToRedo.find(User)!=prehToRedo.end()){
+				Instruction* redoInst = prehToRedo[User];
+				BasicBlock* redoBB = redoInst->getParent();
+				BasicBlock* currentRedo = prehToRedo[currentInst]->getParent();
+				Instruction* redoInstFirstLoad = instToFirstLoad[User];
+				int userOrder = firstLoadOrder[redoInstFirstLoad];
+				int currentOrder = firstLoadOrder[it->second];
+				if (userOrder>currentOrder){
+					pair<BasicBlock*, BasicBlock*> temp; 
+					temp.first = currentRedo;
+					temp.second = redoBB;
+					if (dependBBMap.find(temp)==dependBBMap.end()){
+						dependBBMap[temp] = 1;
+					}
+					errs()<<"first block"<<*currentRedo<<"\n";
+					errs()<<"second block"<<*redoBB<<"\n";
+					Instruction* flag = BBFlagMap[redoBB];
+					StoreInst *ST = new StoreInst(ConstantInt::getTrue(currentRedo->getContext()), flag, currentRedo->getTerminator());
+				}
+			}
+		}
+	}
+
+
+
 
 	// FOR TEST: check the inst in the preheader
 	errs()<<"check after the inst is hoisted into the preheader. now insts in the preheader are:\n";
